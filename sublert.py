@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 # Announced and released during OWASP Seasides 2019 & NullCon.
-# Huge shout out to the indian bug bounty community for their hospitality.
+# Huge shout out to the Indian bug bounty community for their hospitality.
 
 import argparse
 import dns.resolver
@@ -24,7 +24,7 @@ else:
 from config import *
 import time
 
-version = "1.0.0"
+version = "1.4.7"
 requests.packages.urllib3.disable_warnings()
 
 def banner():
@@ -80,19 +80,12 @@ def parse_args():
 
 def domain_sanity_check(domain): #Verify the domain name sanity
     if domain:
-        if ("http://" or "https://") not in domain:
-            try:
-                domain = get_fld("https://" + domain)
-                return domain
-            except:
-                print(colored("[!] Incorrect domain format. Please follow this format: example.com, https://example.com, www.example.com", "red"))
-                sys.exit(1)
-        else:
-            try:
-                domain = get_fld(domain)
-            except:
-                print(colored("[!] Incorrect domain name. Please follow this format: example.com, https://example.com, www.example.com", "red"))
-                sys.exit(1)
+        try:
+            domain = get_fld(domain, fix_protocol = True)
+            return domain
+        except:
+            print(colored("[!] Incorrect domain format. Please follow this format: example.com, http(s)://example.com, www.example.com", "red"))
+            sys.exit(1)
     else:
         pass
 
@@ -106,10 +99,11 @@ def slack(data): #posting to Slack
                             )
     if response.status_code != 200:
         error = "Request to slack returned an error {}, the response is:\n{}".format(response.status_code, response.text)
-        errorlog(errorlog, enable_logging)
-    time.sleep(1) #bypass Slack rate limit when using free workpalce, remove this line if you've pro subscription
+        errorlog(error, enable_logging)
+    if slack_sleep_enabled:
+        time.sleep(1)
 
-def reset(do_reset):
+def reset(do_reset): #clear the monitored list of domains and remove all locally stored files
     if do_reset:
         os.system("cd ./output/ && rm -f *.txt && cd .. && rm -f domains.txt && touch domains.txt")
         print(colored("\n[!] Sublert was reset successfully. Please add new domains to monitor!", "red"))
@@ -154,34 +148,15 @@ def errorlog(error, enable_logging): #log errors and post them to slack channel
                                 )
         if response.status_code != 200:
             error = "Request to slack returned an error {}, the response is:\n{}".format(response.status_code, response.text)
-            errorlog(errorlog, enable_logging)
+            errorlog(error, enable_logging)
     else: pass
 
 class cert_database(object): #Connecting to crt.sh public API to retrieve subdomains
     global enable_logging
     def lookup(self, domain, wildcard = True):
-        base_url = "https://crt.sh/?q={}&output=json"
-        if wildcard:
-            domain = "%25.{}".format(domain)
-            url = base_url.format(domain)
-        subdomains = []
-        user_agent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.14; rv:64.0) Gecko/20100101 Firefox/64.0'
-
         try:
-            req = requests.get(url, headers={'User-Agent': user_agent}, timeout=20, verify=False) #times out after 8 seconds waiting
-            if req.status_code == 200:
-                try:
-                    content = req.content.decode('utf-8')
-                    data = json.loads(content)
-                    for subdomain in data:
-                        subdomains.append(subdomain["name_value"])
-                    return subdomains
-                except:
-                    error = "Error retrieving information for {}.".format(domain.replace('%25.', ''))
-                    errorlog(error, enable_logging)
-        except:
             try: #connecting to crt.sh postgres database to retrieve subdomains in case API fails
-                unique_domains = []
+                unique_domains = set()
                 domain = domain.replace('%25.', '')
                 conn = psycopg2.connect("dbname={0} user={1} host={2}".format(DB_NAME, DB_USER, DB_HOST))
                 conn.autocommit = True
@@ -192,13 +167,30 @@ class cert_database(object): #Connecting to crt.sh public API to retrieve subdom
                     for subdomain in matches:
                         try:
                             if get_fld("https://" + subdomain) == domain:
-                                unique_domains.append(subdomain)
+                                unique_domains.add(subdomain.lower())
                         except: pass
-                return unique_domains
+                return sorted(unique_domains)
             except:
-                print(colored("[!] Unable to connect to the database.".format(domain), "red"))
                 error = "Unable to connect to the database."
                 errorlog(error, enable_logging)
+        except:
+            base_url = "https://crt.sh/?q={}&output=json"
+            if wildcard:
+                domain = "%25.{}".format(domain)
+                url = base_url.format(domain)
+            subdomains = set()
+            user_agent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.14; rv:64.0) Gecko/20100101 Firefox/64.0'
+            req = requests.get(url, headers={'User-Agent': user_agent}, timeout=20, verify=False) #times out after 8 seconds waiting
+            if req.status_code == 200:
+                try:
+                    content = req.content.decode('utf-8')
+                    data = json.loads(content)
+                    for subdomain in data:
+                        subdomains.add(subdomain["name_value"].lower())
+                    return sorted(subdomains)
+                except:
+                    error = "Error retrieving information for {}.".format(domain.replace('%25.', ''))
+                    errorlog(error, enable_logging)
 
 def queuing(): #using the queue for multithreading purposes
     global domain_to_monitor
@@ -229,29 +221,30 @@ def adding_new_domain(q1): #adds a new domain to the monitoring list
         else: pass
         with open("domains.txt", "r+") as domains: #checking domain name isn't already monitored
             for line in domains:
-                if domain_to_monitor in line:
+                if domain_to_monitor == line.replace('\n', ''):
                     print(colored("[!] The domain name {} is already being monitored.".format(domain_to_monitor), "red"))
                     sys.exit(1)
             response = cert_database().lookup(domain_to_monitor)
-            if response:
-                with open("./output/" + domain_to_monitor.lower() + ".txt", "a") as subdomains: #saving a copy of current subdomains
-                    for subdomain in response:
-                        subdomains.write(subdomain + "\n")
-                with open("domains.txt", "a") as domains: #fetching subdomains if not monitored
-                    domains.write(domain_to_monitor + '\n')
-                    print(colored("\n[+] Adding {} to the monitored list of domains.\n".format(domain_to_monitor), "yellow"))
-                try: input = raw_input #fixes python 2.x and 3.x input keyword
-                except NameError: pass
-                choice = input(colored("[?] Do you wish to list subdomains found for {}? [Y]es [N]o (default: [N]) ".format(domain_to_monitor), "red")) #listing subdomains upon request
-                if choice.upper() == "Y":
+            with open("./output/" + domain_to_monitor.lower() + ".txt", "a") as subdomains: #saving a copy of current subdomains
+                for subdomain in response:
+                    subdomains.write(subdomain + "\n")
+            with open("domains.txt", "a") as domains: #fetching subdomains if not monitored
+                domains.write(domain_to_monitor.lower() + '\n')
+                print(colored("\n[+] Adding {} to the monitored list of domains.\n".format(domain_to_monitor), "yellow"))
+            try: input = raw_input #fixes python 2.x and 3.x input keyword
+            except NameError: pass
+            choice = input(colored("[?] Do you wish to list subdomains found for {}? [Y]es [N]o (default: [N]) ".format(domain_to_monitor), "yellow")) #listing subdomains upon request
+            if choice.upper() == "Y":
+                if response:
                     for subdomain in response:
                         unique_list.append(subdomain)
                     unique_list = list(set(unique_list))
                     for subdomain in unique_list:
                         print(colored(subdomain, "yellow"))
                 else:
-                    sys.exit(1)
-            else: pass
+                    print(colored("\n[!] Unfortunately, we couldn't find any subdomain for {}".format(domain_to_monitor), "red"))
+            else:
+                sys.exit(1)
     else: #checks if a domain is monitored but has no text file saved in ./output
                 try:
                     line = q1.get(timeout=10)
@@ -298,7 +291,10 @@ def compare_files_diff(domain_to_monitor): #compares the temporary text file wit
                         changes = [l for l in diff if l.startswith('+ ')] #check if there are new items/subdomains
                         newdiff = []
                         for c in changes:
-                            result.append(c.replace('\n', ''))
+                            c = c.replace('+ ', '')
+                            c = c.replace('*.', '')
+                            c = c.replace('\n', '')
+                            result.append(c)
                             result = list(set(result)) #remove duplicates
                     except:
                         error = "There was an error opening one of the files: {} or {}".format(domain_to_monitor + '.txt', domain_to_monitor + '_tmp.txt')
@@ -316,7 +312,7 @@ def dns_resolution(new_subdomains): #Perform DNS resolution on retrieved subdoma
         dns_results[domain] = {}
         try:
             for qtype in ['A','CNAME']:
-                dns_output = dns.resolver.query(domain,qtype, raise_on_no_answer=False)
+                dns_output = dns.resolver.query(domain,qtype, raise_on_no_answer = False)
                 if dns_output.rrset is None:
                     pass
                 elif dns_output.rdtype == 1:
@@ -327,7 +323,6 @@ def dns_resolution(new_subdomains): #Perform DNS resolution on retrieved subdoma
                     dns_results[domain]["CNAME"] = cname_records
                 else: pass
         except dns.resolver.NXDOMAIN:
-            dns_results[domain]["A"] = eval('["No such domain."]')
             pass
         except dns.resolver.Timeout:
             dns_results[domain]["A"] = eval('["Timed out while resolving."]')
@@ -337,7 +332,13 @@ def dns_resolution(new_subdomains): #Perform DNS resolution on retrieved subdoma
             dns_results[domain]["A"] = eval('["There was an error while resolving."]')
             dns_results[domain]["CNAME"] = eval('["There was an error while resolving."]')
             pass
-    return posting_to_slack(None, True, dns_results)
+    if dns_results:
+        return posting_to_slack(None, True, dns_results) #Slack new subdomains with DNS ouput
+    else:
+        return posting_to_slack(None, False, None) #Nothing found notification
+
+def at_channel(): #control slack @channel
+    return("<!channel> " if at_channel_enabled else "")
 
 def posting_to_slack(result, dns_resolve, dns_output): #sending result to slack workplace
     global domain_to_monitor
@@ -345,16 +346,18 @@ def posting_to_slack(result, dns_resolve, dns_output): #sending result to slack 
     if dns_resolve:
         dns_result = dns_output
         if dns_result:
+            dns_result = {k:v for k,v in dns_result.items() if v} #filters non-resolving subdomains
             rev_url = []
-            print(colored("\n[!] Exporting result to Slack. Please don't interrupt!", "red"))
+            print(colored("\n[!] Exporting result to Slack. Please do not interrupt!", "red"))
             for url in dns_result:
                 url = url.replace('*.', '')
-                url = "https://" + url.replace('+ ', '')
-                rev_url.append(get_fld(url))
-            for subdomain in new_subdomains:
-                subdomain = subdomain.replace('*.','')
-                subdomain = subdomain.replace('+ ','')
-                data = "<!channel> :new: {}".format(subdomain)
+                url = url.replace('+ ', '')
+                rev_url.append(get_fld(url, fix_protocol = True))
+
+            unique_list = list(set(new_subdomains) & set(dns_result.keys())) #filters non-resolving subdomains from new_subdomains list
+
+            for subdomain in unique_list:
+                data = "{}:new: {}".format(at_channel(), subdomain)
                 slack(data)
                 try:
                     if dns_result[subdomain]["A"]:
@@ -381,7 +384,7 @@ def posting_to_slack(result, dns_resolve, dns_output): #sending result to slack 
         for url in result:
             url = "https://" + url.replace('+ ', '')
             rev_url.append(get_fld(url))
-            data = "<!channel> :new: {}".format(url)
+            data = "{}:new: {}".format(at_channel(), url)
             slack(data)
         print(colored("\n[!] Done. ", "green"))
         rev_url = list(set(rev_url))
@@ -393,7 +396,7 @@ def posting_to_slack(result, dns_resolve, dns_output): #sending result to slack 
 
     else:
         if not domain_to_monitor:
-            data = "<!channel> :-1: We couldn't find any new subdomains."
+            data = "{}:-1: We couldn't find any new valid subdomains.".format(at_channel())
             slack(data)
             print(colored("\n[!] Done. ", "green"))
             os.system("rm -f ./output/*_tmp.txt")
